@@ -18,12 +18,17 @@ A keyboard-driven TUI for managing git worktrees. See all your worktrees at a gl
 
 ## Features
 
-- **Dashboard view** — All worktrees with dirty state, remote sync, age at a glance
-- **Detail panel** — Changed files, last commit, notes without leaving the list
+- **Dashboard view** — All worktrees with dirty state, remote sync, CI status, and active agents at a glance
+- **Detail panel** — Changed files, last commit, CI jobs, agent status, notes
 - **Fuzzy branch autocomplete** — Create worktrees fast with branch search
 - **Smart cleanup** — Detect stale (remote deleted) and merged worktrees, prune in bulk
+- **CI/CD status** — GitHub Actions and GitLab CI per branch, auto-detected from remote
+- **AI agent detection** — See which worktrees have Claude Code, Codex, Cursor, or Aider active
+- **tmux / zellij integration** — Open worktrees in new windows or splits directly from grove
 - **Notes** — Attach context to any worktree ("fixing prod incident", "PR #42")
 - **Colors & icons** — Tag worktrees visually for quick identification
+- **Config file** — `.grove.toml` for path patterns, hooks, CI provider, tmux behavior
+- **Lifecycle hooks** — Run commands on worktree create/delete (e.g. `npm install`, `cp .env`)
 - **Bare repo first-class** — Works in bare repo + worktree layouts out of the box
 - **Shell integration** — Select a worktree and `cd` into it
 
@@ -75,6 +80,8 @@ grove
 | `n` | Edit note |
 | `c` | Color / icon picker |
 | `p` | Prune stale & merged worktrees |
+| `t` | tmux / zellij menu |
+| `w` | Open CI run in browser |
 | `r` | Refresh |
 | `Enter` | Open (cd into worktree) |
 | `?` | Help |
@@ -94,22 +101,51 @@ grove() {
 }
 ```
 
+## Configuration
+
+Create `.grove.toml` in your repo root (or `~/.config/grove/config.toml` for global defaults):
+
+```toml
+[core]
+base_branch = "main"
+path_pattern = "../{branch_slug}"    # {branch_slug}, {branch}, {name}
+
+[tmux]
+enabled = true
+auto_open = "none"                   # "window", "hsplit", "vsplit", "none"
+session_prefix = "grove"
+shell_command = ""                   # run after opening (e.g. "nvim .")
+
+[ci]
+provider = "auto"                    # "github", "gitlab", "auto", "none"
+
+[agent]
+detect = ["claude", "codex", "cursor", "aider"]
+
+[hooks]
+post_create = [
+  "cp .env.example .env",
+  "npm install",
+]
+pre_delete = ["git stash"]
+post_delete = []
+
+[appearance]
+default_color = "none"
+default_icon = ""
+```
+
+All fields are optional — grove works without any config file.
+
 ## How It Works
 
-grove reads worktree data directly from `git worktree list --porcelain` and runs `git status` in parallel across all worktrees for fast loading. Metadata (notes, colors, icons) is stored in `.grove/worktrees.json` inside your repo.
+grove reads worktree data directly from `git worktree list --porcelain` and runs `git status` in parallel across all worktrees for fast loading. CI status loads asynchronously via `gh` / `glab` CLI. Agent detection checks for known marker directories (`.claude/`, `.codex/`, etc.).
 
 ```
 .grove/
-└── worktrees.json    # notes, colors, icons per worktree
+├── worktrees.json    # notes, colors, icons per worktree
+.grove.toml           # optional config (repo root)
 ```
-
-## Roadmap
-
-- [ ] CI/CD status (GitHub Actions, GitLab CI)
-- [ ] AI agent detection (Claude Code, Codex, Cursor)
-- [ ] tmux / zellij integration
-- [ ] `.grove.toml` config file
-- [ ] Lifecycle hooks (post-create, pre-delete)
 
 ## License
 

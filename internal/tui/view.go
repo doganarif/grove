@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/doganarif/grove/internal/tmux"
 )
 
 func (m Model) View() string {
@@ -15,7 +16,6 @@ func (m Model) View() string {
 		return "\n  Loading worktrees...\n"
 	}
 
-	// Overlay modals
 	switch m.mode {
 	case modeHelp:
 		return m.viewHelp()
@@ -29,6 +29,8 @@ func (m Model) View() string {
 		return m.viewWithModal(m.viewColorModal())
 	case modeNote:
 		return m.viewWithModal(m.viewNoteModal())
+	case modeTmux:
+		return m.viewWithModal(m.viewTmuxModal())
 	}
 
 	return m.viewMain()
@@ -42,14 +44,28 @@ func (m Model) viewMain() string {
 	if m.isBare {
 		repoLabel += " (.bare)"
 	}
+
+	agentCount := 0
+	for _, it := range m.items {
+		if it.Agent != nil && it.Agent.Active {
+			agentCount++
+		}
+	}
+
 	header := styleHeader.Render(" grove") +
 		styleMuted.Render("  "+repoLabel) +
 		styleMuted.Render(fmt.Sprintf("  %d worktrees", len(m.items)))
+	if agentCount > 0 {
+		header += styleMuted.Render(fmt.Sprintf("  ⎇ %d agents", agentCount))
+	}
+	if m.mux != tmux.None {
+		header += styleMuted.Render("  " + m.mux.String())
+	}
 	b.WriteString(header + "\n\n")
 
 	vis := m.visibleItems()
 
-	// Column widths
+	// Dynamic column widths
 	nameW := 18
 	branchW := 22
 	for _, it := range vis {
@@ -61,19 +77,19 @@ func (m Model) viewMain() string {
 		}
 	}
 
-	// Build list content
 	var listContent strings.Builder
 
 	// Column headers
-	colHeader := fmt.Sprintf(" %-3s%-*s %-*s %-8s %-6s %s",
+	colHeader := fmt.Sprintf(" %-3s%-*s %-*s %-8s %-4s %-8s %-6s %s",
 		"", nameW, styleColHeader.Render("WORKTREE"),
 		branchW, styleColHeader.Render("BRANCH"),
 		styleColHeader.Render("STATUS"),
+		styleColHeader.Render("CI"),
+		styleColHeader.Render("AGENT"),
 		styleColHeader.Render("REMOTE"),
 		styleColHeader.Render("AGE"))
 	listContent.WriteString(colHeader + "\n")
 
-	// Rows
 	for i, it := range vis {
 		listContent.WriteString(m.viewRow(i, it, nameW, branchW) + "\n")
 	}
@@ -86,7 +102,7 @@ func (m Model) viewMain() string {
 	listStr := listContent.String()
 	if m.showDetail && len(vis) > 0 && m.cursor < len(vis) {
 		detail := m.viewDetail(vis[m.cursor])
-		detailWidth := min(42, m.width/3)
+		detailWidth := min(44, m.width/3)
 		detailStyled := styleDetailBorder.Width(detailWidth).Render(detail)
 		listWidth := m.width - detailWidth - 4
 		if listWidth > 20 {
@@ -112,12 +128,12 @@ func (m Model) viewMain() string {
 		}
 	}
 
-	// Status message
+	// Status
 	if m.statusMsg != "" {
 		b.WriteString("\n" + styleMuted.Render(" "+m.statusMsg))
 	}
 
-	// Filter bar
+	// Filter
 	if m.mode == modeFilter {
 		b.WriteString("\n " + m.filterInput.View())
 	} else if m.filterText != "" {
@@ -125,14 +141,18 @@ func (m Model) viewMain() string {
 	}
 
 	// Help bar
-	b.WriteString("\n\n")
-	b.WriteString(styleHelp.Render(" a add  d del  D del+branch  n note  c color  p prune  / filter  ? help  q quit"))
+	help := " a add  d del  D del+branch  n note  c color  p prune  / filter"
+	if m.mux != tmux.None {
+		help += "  t " + m.mux.String()
+	}
+	help += "  w ci  ? help  q quit"
+	b.WriteString("\n\n" + styleHelp.Render(help))
 
 	return b.String()
 }
 
 func (m Model) viewRow(idx int, it item, nameW, branchW int) string {
-	// Cursor indicator
+	// Cursor
 	cursor := "  "
 	nameStyle := lipgloss.NewStyle()
 	if idx == m.cursor {
@@ -154,7 +174,6 @@ func (m Model) viewRow(idx int, it item, nameW, branchW int) string {
 		icon = " "
 	}
 
-	// Name
 	name := nameStyle.Render(truncate(it.Name, nameW-1))
 
 	// Branch
@@ -171,6 +190,19 @@ func (m Model) viewRow(idx int, it item, nameW, branchW int) string {
 		status = styleWarning.Render(it.Status.String())
 	}
 
+	// CI
+	ciStr := ciIndicator(it.CI.State)
+
+	// Agent
+	agentStr := styleMuted.Render("—")
+	if it.Agent != nil {
+		if it.Agent.Active {
+			agentStr = styleInfo.Render(it.Agent.Name)
+		} else {
+			agentStr = styleMuted.Render(it.Agent.Name)
+		}
+	}
+
 	// Remote
 	var remote string
 	switch {
@@ -184,20 +216,20 @@ func (m Model) viewRow(idx int, it item, nameW, branchW int) string {
 		remote = styleInfo.Render(it.Remote.String())
 	}
 
-	// Age
 	age := styleMuted.Render(it.Age)
 
-	// Lock indicator
 	lock := " "
 	if it.Locked {
 		lock = "🔒"
 	}
 
-	return fmt.Sprintf("%s%s%s%-*s %-*s %-8s %-6s %s %s",
+	return fmt.Sprintf("%s%s%s%-*s %-*s %-8s %-4s %-8s %-6s %s %s",
 		cursor, dot, icon,
 		nameW, name,
 		branchW, branch,
 		status,
+		ciStr,
+		agentStr,
 		remote,
 		age,
 		lock)
@@ -206,14 +238,12 @@ func (m Model) viewRow(idx int, it item, nameW, branchW int) string {
 func (m Model) viewDetail(it item) string {
 	var b strings.Builder
 
-	// Title
 	title := colorDot(it.Meta.Color) + " " + it.Meta.Icon
 	if it.Meta.Icon == "" {
 		title = colorDot(it.Meta.Color)
 	}
 	b.WriteString(styleHeader.Render(title+" "+it.Name) + "\n\n")
 
-	// Fields
 	row := func(label, val string) {
 		b.WriteString(styleDetailLabel.Render(label) + styleDetailVal.Render(val) + "\n")
 	}
@@ -232,6 +262,29 @@ func (m Model) viewDetail(it item) string {
 	if it.Meta.Note != "" {
 		b.WriteString("\n" + styleColHeader.Render("NOTE") + "\n")
 		b.WriteString(styleMuted.Render(it.Meta.Note) + "\n")
+	}
+
+	// CI
+	if it.CI.State != "" && it.CI.State != "none" {
+		b.WriteString("\n" + styleColHeader.Render("CI/CD") + "\n")
+		b.WriteString(ciIndicator(it.CI.State) + " " + ciLabel(it.CI.State))
+		if it.CI.RunName != "" {
+			b.WriteString(styleMuted.Render("  " + it.CI.RunName))
+		}
+		b.WriteString("\n")
+		if it.CI.RunURL != "" {
+			b.WriteString(styleMuted.Render("  w to open in browser") + "\n")
+		}
+	}
+
+	// Agent
+	if it.Agent != nil {
+		b.WriteString("\n" + styleColHeader.Render("AGENT") + "\n")
+		if it.Agent.Active {
+			b.WriteString(styleInfo.Render("● "+it.Agent.Name) + styleMuted.Render(" (active)") + "\n")
+		} else {
+			b.WriteString(styleMuted.Render("○ "+it.Agent.Name+" (inactive)") + "\n")
+		}
 	}
 
 	// Changed files
@@ -273,7 +326,6 @@ func (m Model) viewAddModal() string {
 	b.WriteString(styleHeader.Render("New Worktree") + "\n\n")
 	b.WriteString("Branch:  " + m.addInput.View() + "\n")
 
-	// Autocomplete suggestions
 	limit := min(len(m.addMatches), 8)
 	if limit > 0 {
 		b.WriteString(styleMuted.Render("         ─────────────────────────") + "\n")
@@ -292,6 +344,14 @@ func (m Model) viewAddModal() string {
 
 	b.WriteString("\n")
 	b.WriteString("Base:    " + styleMuted.Render(m.baseBranch) + "\n")
+
+	if len(m.cfg.Hooks.PostCreate) > 0 {
+		b.WriteString("\n" + styleMuted.Render("Post-create hooks:") + "\n")
+		for _, h := range m.cfg.Hooks.PostCreate {
+			b.WriteString(styleMuted.Render("  → "+h) + "\n")
+		}
+	}
+
 	b.WriteString("\n")
 	b.WriteString(styleHelp.Render("enter create  tab autocomplete  ↑↓ navigate  esc cancel"))
 
@@ -308,10 +368,24 @@ func (m Model) viewDeleteModal() string {
 	var b strings.Builder
 	b.WriteString(styleHeader.Render("Delete Worktree") + "\n\n")
 	b.WriteString(fmt.Sprintf("  %s  %s\n", styleWarning.Render(it.Name), styleMuted.Render(it.Branch)))
+
+	if it.Agent != nil && it.Agent.Active {
+		b.WriteString("\n" + styleError.Render("  ⚠ "+it.Agent.Name+" agent is active in this worktree") + "\n")
+	}
+
 	b.WriteString("\n")
 	if m.delBranch {
 		b.WriteString(styleError.Render("  ⚠ Will also delete local branch") + "\n\n")
 	}
+
+	if len(m.cfg.Hooks.PreDelete) > 0 {
+		b.WriteString(styleMuted.Render("  Pre-delete hooks will run:") + "\n")
+		for _, h := range m.cfg.Hooks.PreDelete {
+			b.WriteString(styleMuted.Render("    → "+h) + "\n")
+		}
+		b.WriteString("\n")
+	}
+
 	b.WriteString(styleHelp.Render("y confirm  n/esc cancel"))
 
 	return b.String()
@@ -327,7 +401,6 @@ func (m Model) viewPruneModal() string {
 		return b.String()
 	}
 
-	// Group by reason
 	var gone, merged []int
 	for i, pi := range m.pruneItems {
 		switch pi.reason {
@@ -353,10 +426,17 @@ func (m Model) viewPruneModal() string {
 			if pi.selected {
 				check = styleSuccess.Render("☑")
 			}
+
 			name := pi.item.Name
 			branch := styleMuted.Render(pi.item.Branch)
 			age := styleMuted.Render(pi.item.Age)
-			b.WriteString(fmt.Sprintf("%s%s %s  %s  %s\n", cursor, check, name, branch, age))
+
+			agentWarn := ""
+			if pi.item.Agent != nil && pi.item.Agent.Active {
+				agentWarn = styleError.Render(" ⚠ agent")
+			}
+
+			b.WriteString(fmt.Sprintf("%s%s %s  %s  %s%s\n", cursor, check, name, branch, age, agentWarn))
 		}
 		b.WriteString("\n")
 	}
@@ -387,7 +467,6 @@ func (m Model) viewColorModal() string {
 	var b strings.Builder
 	b.WriteString(styleHeader.Render("Appearance: "+it.Name) + "\n\n")
 
-	// Color row
 	colorLabel := "  Color:  "
 	if m.colorRow == 0 {
 		colorLabel = styleCursor.Render("› Color:  ")
@@ -404,7 +483,6 @@ func (m Model) viewColorModal() string {
 	}
 	b.WriteString("\n\n")
 
-	// Icon row
 	iconLabel := "  Icon:   "
 	if m.colorRow == 1 {
 		iconLabel = styleCursor.Render("› Icon:   ")
@@ -437,6 +515,42 @@ func (m Model) viewNoteModal() string {
 	b.WriteString(styleHeader.Render("Note: "+it.Name) + "\n\n")
 	b.WriteString(m.noteInput.View() + "\n\n")
 	b.WriteString(styleHelp.Render("ctrl+s save  esc cancel"))
+
+	return b.String()
+}
+
+func (m Model) viewTmuxModal() string {
+	vis := m.visibleItems()
+	if m.cursor >= len(vis) {
+		return ""
+	}
+	it := vis[m.cursor]
+
+	var b strings.Builder
+	muxName := m.mux.String()
+	b.WriteString(styleHeader.Render(muxName+": "+it.Name) + "\n\n")
+
+	options := []string{
+		"Open in new window",
+		"Open in horizontal split",
+		"Open in vertical split",
+	}
+
+	sessionName := m.cfg.Tmux.SessionPrefix + ":" + it.Name
+	if tmux.SessionExists(sessionName) {
+		options = append(options, "Kill session: "+sessionName)
+	}
+
+	for i, opt := range options {
+		if i == m.tmuxCursor {
+			b.WriteString(styleCursor.Render("  › "+opt) + "\n")
+		} else {
+			b.WriteString(styleMuted.Render("    "+opt) + "\n")
+		}
+	}
+
+	b.WriteString("\n")
+	b.WriteString(styleHelp.Render("enter select  esc cancel"))
 
 	return b.String()
 }
@@ -475,6 +589,11 @@ func (m Model) viewHelp() string {
 		{"enter", "open (cd into worktree)"},
 	})
 
+	section("INTEGRATIONS", [][2]string{
+		{"t", "tmux / zellij menu"},
+		{"w", "open CI run in browser"},
+	})
+
 	section("GENERAL", [][2]string{
 		{"?", "toggle help"},
 		{"q", "quit"},
@@ -487,6 +606,36 @@ func (m Model) viewHelp() string {
 }
 
 // Helpers
+
+func ciIndicator(state string) string {
+	switch state {
+	case "passed":
+		return styleSuccess.Render("✅")
+	case "failed":
+		return styleError.Render("❌")
+	case "running":
+		return styleWarning.Render("🔄")
+	case "cancelled":
+		return styleMuted.Render("⊘")
+	default:
+		return styleMuted.Render("—")
+	}
+}
+
+func ciLabel(state string) string {
+	switch state {
+	case "passed":
+		return styleSuccess.Render("passed")
+	case "failed":
+		return styleError.Render("failed")
+	case "running":
+		return styleWarning.Render("running")
+	case "cancelled":
+		return styleMuted.Render("cancelled")
+	default:
+		return styleMuted.Render("none")
+	}
+}
 
 func truncate(s string, maxLen int) string {
 	if len(s) <= maxLen {

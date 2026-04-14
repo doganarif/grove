@@ -1,17 +1,22 @@
 package tui
 
 import (
-	"path/filepath"
 	"fmt"
+	"os/exec"
+	"path/filepath"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/sahilm/fuzzy"
 
+	"github.com/doganarif/grove/internal/agent"
+	"github.com/doganarif/grove/internal/ci"
+	"github.com/doganarif/grove/internal/config"
 	"github.com/doganarif/grove/internal/git"
 	"github.com/doganarif/grove/internal/store"
+	"github.com/doganarif/grove/internal/tmux"
 )
 
 type mode int
@@ -25,6 +30,7 @@ const (
 	modeNote
 	modeHelp
 	modeFilter
+	modeTmux
 )
 
 type item struct {
@@ -34,11 +40,13 @@ type item struct {
 	Name      string
 	Age       string
 	IsCurrent bool
+	Agent     *agent.Info
+	CI        ci.Status
 }
 
 type pruneItem struct {
-	item   item
-	reason string // "gone", "merged", "inactive"
+	item     item
+	reason   string // "gone", "merged"
 	selected bool
 }
 
@@ -48,13 +56,15 @@ type Model struct {
 	height     int
 	showDetail bool
 
-	items     []item
-	cursor    int
-	repoRoot  string
-	repoName  string
-	isBare    bool
+	items      []item
+	cursor     int
+	repoRoot   string
+	repoName   string
+	isBare     bool
 	baseBranch string
-	store     *store.Store
+	store      *store.Store
+	cfg        config.Config
+	mux        tmux.Multiplexer
 
 	// Filter
 	filterInput textinput.Model
@@ -78,12 +88,15 @@ type Model struct {
 	pruneCursor int
 
 	// Color picker
-	colorRow int // 0=color, 1=icon
+	colorRow int
 	colorIdx int
 	iconIdx  int
 
 	// Note editor
 	noteInput textarea.Model
+
+	// Tmux menu
+	tmuxCursor int
 
 	// Output
 	Selected string
@@ -99,6 +112,10 @@ type Model struct {
 type worktreesLoadedMsg struct {
 	items []item
 	err   error
+}
+
+type ciLoadedMsg struct {
+	statuses map[string]ci.Status
 }
 
 type branchesLoadedMsg struct {
@@ -121,6 +138,13 @@ func New() (Model, error) {
 		return Model{}, err
 	}
 
+	cfg := config.Load(root)
+
+	base := cfg.Core.BaseBranch
+	if base == "" {
+		base = git.BaseBranch()
+	}
+
 	fi := textinput.New()
 	fi.Placeholder = "filter..."
 	fi.CharLimit = 50
@@ -139,8 +163,10 @@ func New() (Model, error) {
 		repoRoot:    root,
 		repoName:    filepath.Base(root),
 		isBare:      git.IsBareRepo(),
-		baseBranch:  git.BaseBranch(),
+		baseBranch:  base,
 		store:       st,
+		cfg:         cfg,
+		mux:         tmux.Detect(),
 		loading:     true,
 		filterInput: fi,
 		addInput:    ai,
@@ -150,7 +176,7 @@ func New() (Model, error) {
 }
 
 func (m Model) Init() tea.Cmd {
-	return loadWorktrees(m.repoRoot, m.store)
+	return loadWorktrees(m.repoRoot, m.store, m.cfg)
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -170,6 +196,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.cursor >= len(m.items) {
 			m.cursor = max(0, len(m.items)-1)
 		}
+		// Trigger async CI load
+		var branches []string
+		for _, it := range m.items {
+			if it.Branch != "" {
+				branches = append(branches, it.Branch)
+			}
+		}
+		return m, loadCI(branches, m.cfg.CI.Provider)
+
+	case ciLoadedMsg:
+		for i := range m.items {
+			if s, ok := msg.statuses[m.items[i].Branch]; ok {
+				m.items[i].CI = s
+			}
+		}
 		return m, nil
 
 	case branchesLoadedMsg:
@@ -183,10 +224,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.statusMsg = msg.msg
 		}
-		return m, loadWorktrees(m.repoRoot, m.store)
+		return m, loadWorktrees(m.repoRoot, m.store, m.cfg)
 
 	case tea.KeyMsg:
-		// Global quit
 		if m.mode == modeList && msg.String() == "q" {
 			return m, tea.Quit
 		}
@@ -209,6 +249,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateColor(msg)
 		case modeNote:
 			return m.updateNote(msg)
+		case modeTmux:
+			return m.updateTmux(msg)
 		case modeHelp:
 			m.mode = modeList
 			return m, nil
@@ -278,6 +320,18 @@ func (m Model) updateList(msg tea.KeyMsg) (Model, tea.Cmd) {
 			m.colorIdx = colorIndex(meta.Color)
 			m.iconIdx = iconIndex(meta.Icon)
 		}
+	case "t":
+		if n > 0 && m.mux != tmux.None {
+			m.mode = modeTmux
+			m.tmuxCursor = 0
+		} else if m.mux == tmux.None {
+			m.statusMsg = "no tmux/zellij session detected"
+		}
+	case "w":
+		if n > 0 && vis[m.cursor].CI.RunURL != "" {
+			exec.Command("open", vis[m.cursor].CI.RunURL).Start()
+			m.statusMsg = "opening CI in browser..."
+		}
 	case "p":
 		m.buildPruneList()
 		if len(m.pruneItems) > 0 {
@@ -292,7 +346,7 @@ func (m Model) updateList(msg tea.KeyMsg) (Model, tea.Cmd) {
 		m.filterInput.Focus()
 	case "r":
 		m.loading = true
-		return m, loadWorktrees(m.repoRoot, m.store)
+		return m, loadWorktrees(m.repoRoot, m.store, m.cfg)
 	case "s":
 		m.sortCol = (m.sortCol + 1) % 4
 	case "?":
@@ -335,7 +389,7 @@ func (m Model) updateAdd(msg tea.KeyMsg) (Model, tea.Cmd) {
 		}
 		m.mode = modeList
 		m.loading = true
-		return m, addWorktreeCmd(m.repoRoot, branch, m.baseBranch)
+		return m, addWorktreeCmd(m.repoRoot, branch, m.baseBranch, m.cfg)
 	case "up":
 		if m.addIdx > 0 {
 			m.addIdx--
@@ -373,7 +427,7 @@ func (m Model) updateDelete(msg tea.KeyMsg) (Model, tea.Cmd) {
 	case "y":
 		m.mode = modeList
 		m.loading = true
-		return m, deleteWorktreeCmd(it.Path, it.Branch, m.delBranch)
+		return m, deleteWorktreeCmd(it.Path, it.Branch, m.delBranch, m.cfg)
 	case "n", "esc":
 		m.mode = modeList
 	}
@@ -456,7 +510,6 @@ func (m Model) updateColor(msg tea.KeyMsg) (Model, tea.Cmd) {
 			}
 			meta.Icon = icon
 			m.store.Set(it.Name, meta)
-			// Update item in-place
 			for i := range m.items {
 				if m.items[i].Name == it.Name {
 					m.items[i].Meta = meta
@@ -497,9 +550,68 @@ func (m Model) updateNote(msg tea.KeyMsg) (Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m Model) updateTmux(msg tea.KeyMsg) (Model, tea.Cmd) {
+	vis := m.visibleItems()
+	if len(vis) == 0 {
+		m.mode = modeList
+		return m, nil
+	}
+	it := vis[m.cursor]
+
+	menuLen := m.tmuxMenuLen(it)
+
+	switch msg.String() {
+	case "j", "down":
+		if m.tmuxCursor < menuLen-1 {
+			m.tmuxCursor++
+		}
+	case "k", "up":
+		if m.tmuxCursor > 0 {
+			m.tmuxCursor--
+		}
+	case "enter":
+		sessionName := m.cfg.Tmux.SessionPrefix + ":" + it.Name
+		shell := m.cfg.Tmux.ShellCommand
+
+		var err error
+		switch m.tmuxCursor {
+		case 0: // new window
+			err = tmux.OpenWindow(it.Path, sessionName, shell)
+		case 1: // hsplit
+			err = tmux.OpenHSplit(it.Path, shell)
+		case 2: // vsplit
+			err = tmux.OpenVSplit(it.Path, shell)
+		case 3: // kill session (only if session exists)
+			if tmux.SessionExists(sessionName) {
+				err = tmux.KillSession(sessionName)
+			}
+		}
+
+		m.mode = modeList
+		if err != nil {
+			m.statusMsg = "tmux: " + err.Error()
+		} else {
+			m.statusMsg = "opened in " + m.mux.String()
+		}
+		return m, nil
+	case "esc":
+		m.mode = modeList
+	}
+	return m, nil
+}
+
+func (m Model) tmuxMenuLen(it item) int {
+	n := 3 // window, hsplit, vsplit
+	sessionName := m.cfg.Tmux.SessionPrefix + ":" + it.Name
+	if tmux.SessionExists(sessionName) {
+		n++ // kill
+	}
+	return n
+}
+
 // Commands
 
-func loadWorktrees(root string, st *store.Store) tea.Cmd {
+func loadWorktrees(root string, st *store.Store, cfg config.Config) tea.Cmd {
 	return func() tea.Msg {
 		wts, err := git.ListWorktrees()
 		if err != nil {
@@ -519,10 +631,18 @@ func loadWorktrees(root string, st *store.Store) tea.Cmd {
 				Name:         name,
 				Age:          git.TimeAgo(infos[i].LastTime),
 				IsCurrent:    wt.Path == currentPath,
+				Agent:        agent.Detect(wt.Path, cfg.Agent.Detect),
 			}
 		}
 
 		return worktreesLoadedMsg{items: items}
+	}
+}
+
+func loadCI(branches []string, provider string) tea.Cmd {
+	return func() tea.Msg {
+		statuses := ci.FetchAll(branches, provider)
+		return ciLoadedMsg{statuses: statuses}
 	}
 }
 
@@ -533,28 +653,41 @@ func loadBranches() tea.Cmd {
 	}
 }
 
-func addWorktreeCmd(root, branch, base string) tea.Cmd {
+func addWorktreeCmd(root, branch, base string, cfg config.Config) tea.Cmd {
 	return func() tea.Msg {
 		slug := strings.ReplaceAll(branch, "/", "-")
-		path := filepath.Join(filepath.Dir(root), slug)
-		if git.IsBareRepo() {
-			path = filepath.Join(root, slug)
-		}
+
+		// Resolve path from config pattern
+		path := resolvePathPattern(cfg.Core.PathPattern, root, branch, slug)
 
 		createBranch := !git.BranchExists(branch)
-		err := git.AddWorktree(path, branch, base, createBranch)
-		if err != nil {
+		if err := git.AddWorktree(path, branch, base, createBranch); err != nil {
 			return actionDoneMsg{err: err}
 		}
+
+		// Run post-create hooks
+		if err := runHooks(cfg.Hooks.PostCreate, path); err != nil {
+			return actionDoneMsg{msg: fmt.Sprintf("created worktree: %s (hook error: %v)", branch, err)}
+		}
+
 		return actionDoneMsg{msg: "created worktree: " + branch}
 	}
 }
 
-func deleteWorktreeCmd(path, branch string, deleteBranch bool) tea.Cmd {
+func deleteWorktreeCmd(path, branch string, deleteBranch bool, cfg config.Config) tea.Cmd {
 	return func() tea.Msg {
+		// Run pre-delete hooks
+		if err := runHooks(cfg.Hooks.PreDelete, path); err != nil {
+			return actionDoneMsg{err: fmt.Errorf("pre-delete hook failed: %w", err)}
+		}
+
 		if err := git.RemoveWorktree(path, true); err != nil {
 			return actionDoneMsg{err: err}
 		}
+
+		// Run post-delete hooks
+		runHooks(cfg.Hooks.PostDelete, filepath.Dir(path))
+
 		if deleteBranch && branch != "" {
 			git.DeleteBranch(branch)
 		}
@@ -576,6 +709,38 @@ func pruneCmd(paths, branches []string) tea.Cmd {
 		}
 		return actionDoneMsg{msg: fmt.Sprintf("pruned %d worktree(s)", len(paths))}
 	}
+}
+
+func runHooks(commands []string, dir string) error {
+	for _, cmd := range commands {
+		c := exec.Command("sh", "-c", cmd)
+		c.Dir = dir
+		if err := c.Run(); err != nil {
+			return fmt.Errorf("%s: %w", cmd, err)
+		}
+	}
+	return nil
+}
+
+func resolvePathPattern(pattern, root, branch, slug string) string {
+	if pattern == "" {
+		pattern = "../{branch_slug}"
+	}
+
+	result := pattern
+	result = strings.ReplaceAll(result, "{branch_slug}", slug)
+	result = strings.ReplaceAll(result, "{branch}", branch)
+	result = strings.ReplaceAll(result, "{name}", slug)
+
+	if !filepath.IsAbs(result) {
+		if git.IsBareRepo() {
+			result = filepath.Join(root, result)
+		} else {
+			result = filepath.Join(filepath.Dir(root), slug)
+		}
+	}
+
+	return result
 }
 
 // Helpers
